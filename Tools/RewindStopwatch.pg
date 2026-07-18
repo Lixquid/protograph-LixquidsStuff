@@ -1,0 +1,90 @@
+/// A tool that stores user positions and rotations while being held, and
+/// moves the user back through them when used.
+module RewindStopwatch
+
+/// This should be pointed at a ValueMultiplexer
+in BufferIndex: int mutable
+in PosBufferEntry: float3 mutable
+in RotBufferEntry: floatQ mutable
+
+in Tool: RawDataTool global
+in RecordDelay: float
+in RewindDelay: float
+in StartIndex: int mutable
+in Rewinding: bool mutable
+
+out HourHand: floatQ
+out MinuteHand: floatQ
+out CapacityHand: floatQ
+out AudioVolume: float
+
+where {
+    GetActiveUserSelf = GetActiveUserSelf;
+    ActiveUserRootSlot = GetActiveUserSelf->UserRootSlot;
+    GlobalTransform = ActiveUserRootSlot->GlobalTransform;
+    WorldTimeTenthFloat = WorldTimeTenthFloat;
+
+    sync RewindVisualStartTime: float;
+
+    switch RawDataToolEvents(Tool)
+    | Equipped |> impulse {
+        // Reset the ring buffer when the tool is equipped
+        StartIndex <- BufferIndex;
+    }
+    | Dequipped |> impulse {
+        // Stop the rewind effect when dropped
+        Rewinding <- false;
+    }
+    | PrimaryPressed |> impulse {
+        Rewinding <- not Rewinding;
+        if Rewinding then impulse {
+            RewindVisualStartTime <- WorldTimeTenthFloat;
+        }
+    };
+
+    _timerInterval = if Rewinding then RewindDelay else RecordDelay;
+    switch SecondsTimer(_timerInterval, UpdatingUser=GetActiveUserSelf->asDrivenGlobal)
+    | OnUpdate |> impulse {
+        if GetActiveUserSelf->NotNull then impulse {
+            if Rewinding then impulse {
+                if BufferIndex == StartIndex then impulse {
+                    // If we hit the start of the ring buffer, we're out of data
+                    Rewinding <- false;
+                } else impulse {
+                    // Otherwise, move back in data
+                    ActiveUserRootSlot
+                    ->SetGlobalPositionRotation(
+                        PosBufferEntry,
+                        RotBufferEntry
+                    );
+                    SetCharacterVelocity(
+                        Character=GetActiveUserSelf->FindCharacterControllerFromUser
+                    );
+                    BufferIndex <- (BufferIndex - 1)->ValueRepeat(2048);
+                }
+            } else impulse {
+                // If we're not rewinding, record a data point
+                PosBufferEntry <- GlobalTransform.GlobalPosition;
+                RotBufferEntry <- GlobalTransform.GlobalRotation;
+                BufferIndex <- (BufferIndex + 1) mod 2048;
+                if BufferIndex == StartIndex then impulse {
+                    // If we're at max capacity, start overwriting the oldest
+                    // entries
+                    StartIndex <- (StartIndex + 1) mod 2048;
+                };
+            };
+        };
+    };
+
+    // When we're not rewinding, act like an actual clock
+    _now = UtcNow->ToLocalTime;
+    _t = _now->DateTimeHour->Cast_int_To_float / 12.0 + _now->DateTimeMinute->Cast_int_To_float / 720.0 + _now->DateTimeSecond->Cast_int_To_float / 43200.0 - ( if Rewinding then (WorldTimeTenthFloat - RewindVisualStartTime) else 0.0)->ValueSmoothLerp(5.0);
+    HourHand = pack(0.0, _t * 360.0, 0.0)->FromEuler_floatQ;
+    MinuteHand = pack(0.0, _t * 4320.0, 0.0)->FromEuler_floatQ;
+
+    _capacity = (BufferIndex - StartIndex)->ValueRepeat(2048)->Cast_int_To_float / 2048.0;
+    CapacityHand = pack(0.0, _capacity * 360.0, 0.0)->FromEuler_floatQ;
+
+    _rewindEffectFactor = Rewinding->ZeroOneFloat->ValueSmoothLerp(3.0);
+    AudioVolume = _rewindEffectFactor;
+}
