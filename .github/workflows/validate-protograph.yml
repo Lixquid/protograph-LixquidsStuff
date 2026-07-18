@@ -1,0 +1,45 @@
+name: Validate Protograph
+
+on:
+    push:
+        paths:
+            - "**/*.pg"
+    pull_request:
+        paths:
+            - "**/*.pg"
+    workflow_dispatch:
+
+jobs:
+    validate:
+        runs-on: ubuntu-latest
+
+        steps:
+            - uses: actions/checkout@v4
+
+            - uses: actions/setup-dotnet@v4
+              with:
+                  dotnet-version: "10.0.x"
+
+            - name: Install Flux SDK
+              run:
+                  dotnet tool install --global Papaltine.FluxSDK --version 1.9.0
+
+            - name: Add .NET tools to PATH
+              run: echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
+
+            - name: Validate Protograph files
+              shell: bash
+              run: |
+                  set -euo pipefail
+
+                  mapfile -d '' files < <(find . -name '*.pg' -print0)
+
+                  if [ ${#files[@]} -eq 0 ]; then
+                    echo "No .pg files found."
+                    exit 0
+                  fi
+
+                  for file in "${files[@]}"; do
+                    echo "Validating $file"
+                    flux-sdk build --stop-after-resolve "$file"
+                  done
