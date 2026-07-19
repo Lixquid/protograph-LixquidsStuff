@@ -1,0 +1,52 @@
+/// A tippy tube that plays audio, showing the progress with the little bobby
+/// thing inside. You can change the speed, both forward and backward, by
+/// tipping the tube.
+module TippyTube
+
+in Playable: IPlayable element
+in ObjectRoot: Slot element
+in AudioInputSlot: Slot element
+in AudioInputFrameSlot: Slot element
+
+out Progress: float
+out AudioInputSlotActive: bool
+
+where {
+    Progress = Playable->NormalizedPosition;
+
+    Pitch =
+        ObjectRoot
+        ->GlobalTransform.GlobalRotation
+        ->EulerAngles_floatQ
+        ->Unpack_Float3.X
+        ->ValueDiv(45.0)
+        ->ValueClamp(-1.0, 1.0);
+
+    NearestUser = ObjectRoot->NearestUserHead.User;
+
+    // Can't directly drive playback speed, so instead get the nearest user to
+    // write the speed every frame.
+    switch NearestUser->FireOnValueChange(Pitch)
+    | OnChanged |> impulse {
+        Playable->SetSpeed(Pitch);
+
+        if not Playable->IsPlaying then impulse {
+            Playable->Play;
+        };
+    };
+
+    // Hide the audio input slot once there's audio in it
+    AudioInputSlotActive = AudioInputSlot->ChildrenCount < 2;
+
+    switch ~receive("Lixquid.TippyTube.Eject")
+    | OnTriggered |> impulse {
+        // Frames contain both the frame mesh and the audio clip, so we need to
+        // eject everything that's not the frame mesh.
+        for _i = AudioInputSlot->ChildrenCount - 1 to 0 by -1 do impulse {
+            _element = AudioInputSlot->GetChild(_i);
+            if _element != AudioInputFrameSlot then impulse {
+                _element->SetParent(LocalUserSpace);
+            };
+        }
+    }
+}
