@@ -1,0 +1,233 @@
+/// All of the behaviour for my Cambox avatar.
+module Cambox
+
+in EyeClose: float
+in CurrentUser: User
+in CurrentLocomotionArchetype: LocomotionArchetype
+in PictureLoaderTexture: IAssetProvider<ITexture2D> element
+in PictureLoaderSlot: Slot element
+in PictureLoaderInserted: bool mutable
+in DefaultFaceTexture: IAssetProvider<ITexture2D> element
+in EyeRotation: floatQ
+
+out TopShutterScale: float3
+out BottomShutterScale: float3
+out LeftGrabVisualActive: bool
+out RightGrabVisualActive: bool
+out FaceTexture: IAssetProvider<ITexture2D>
+out FaceTextureOffset: float2
+
+where {
+    TriggerShutterControl = ~input<bool>("Cambox/TriggerShutterControl").Value;
+    DoubleJumpFly = ~input<bool>("Cambox/DoubleJumpFly").Value;
+
+    ActiveUserHand = CurrentUser->UserPrimaryHand;
+    ActiveUserInVR = CurrentUser->UserVR_Active;
+    ActiveUserInDesktop = not ActiveUserInVR;
+
+    ActiveHandStandardController = CurrentUser->StandardController(ActiveUserHand);
+    ActiveHandCosmosController = CurrentUser->CosmosController(ActiveUserHand);
+    ActiveHandViveController = CurrentUser->ViveController(ActiveUserHand);
+    ActiveHandIndexController = CurrentUser->IndexController(ActiveUserHand);
+    ActiveHandTouchController = CurrentUser->TouchController(ActiveUserHand);
+    ActiveHandHPReverbController = CurrentUser->HPReverbController(ActiveUserHand);
+    ActiveHandWindowsMRController = CurrentUser->WindowsMRController(ActiveUserHand);
+
+    // Dyn Drives //////////////////////////////////////////////////////////////
+    // These are the little orbs showing where your hands are; they only appear
+    // if you're in VR and not holding something.
+    LeftGrabVisualActive = {
+        _grabber =
+            CurrentUser
+            ->GetUserGrabber(BodyNode.LeftHand)
+            ->as<IComponent>
+            ->GetSlot;
+        _holderSlot =
+            _grabber
+            ->FindChildByName(
+                "Holder",
+                MatchSubstring=false,
+                IgnoreCase=false
+            );
+        _holding = _holderSlot->ChildrenCount > 0;
+        ActiveUserInVR and not _holding
+    };
+    RightGrabVisualActive = {
+        _grabber =
+            CurrentUser
+            ->GetUserGrabber(BodyNode.RightHand)
+            ->as<IComponent>
+            ->GetSlot;
+        _holderSlot =
+            _grabber
+            ->FindChildByName(
+                "Holder",
+                MatchSubstring=false,
+                IgnoreCase=false
+            );
+        _holding = _holderSlot->ChildrenCount > 0;
+        ActiveUserInVR and not _holding
+    };
+
+    // Shutter Controller //////////////////////////////////////////////////////
+    sync EyePokedTime: float;
+    Now = WorldTimeFloat;
+    EyePokeCloseAmt = if (Now - EyePokedTime) < 0.3 then 1.0 else 0.0;
+
+    // You can control the top and bottom shutter amounts with your trigger and
+    // grip amounts, respectively.
+    TriggerAmount = ValueMaxMulti(
+        [
+            ActiveHandCosmosController.Trigger,
+            ActiveHandViveController.Trigger,
+            ActiveHandIndexController.Trigger,
+            ActiveHandTouchController.Trigger,
+            ActiveHandHPReverbController.Trigger,
+            ActiveHandWindowsMRController.Trigger,
+            if ActiveUserInDesktop and ActiveHandStandardController.Primary then 1.0 else 0.0
+        ]
+    );
+    GripAmount = ValueMaxMulti(
+        [
+            if ActiveHandCosmosController.GripClick then 1.0 else 0.0,
+            if ActiveHandViveController.Grip then 1.0 else 0.0,
+            ActiveHandIndexController.Grip,
+            ActiveHandTouchController.Grip,
+            ActiveHandHPReverbController.Grip,
+            if ActiveHandWindowsMRController.Grip then 1.0 else 0.0,
+            if ActiveUserInDesktop and ActiveHandStandardController.Grab then 1.0 else 0.0
+        ]
+    );
+    TopShutterScale = {
+        _amt = ValueMaxMulti(
+            [
+                EyeClose,
+                if TriggerShutterControl then TriggerAmount else 0.0,
+                EyePokeCloseAmt
+            ]
+        );
+        pack(1.0, _amt, 1.0)
+    };
+    BottomShutterScale = {
+        _amt = ValueMaxMulti(
+            [
+                EyeClose,
+                if TriggerShutterControl then GripAmount else 0.0,
+                EyePokeCloseAmt
+            ]
+        );
+        pack(1.0, _amt, 1.0)
+    };
+
+    // Poking the eye makes it blink
+    switch ~receive("Cambox.EyePoked")
+    | OnTriggered |> impulse {
+        EyePokedTime <- Now;
+    };
+    switch OnLoaded
+    | Trigger |> impulse {
+        EyePokedTime <- 0.0;
+    };
+
+    // Double Jump Fly Control /////////////////////////////////////////////////
+    store LastPressedTime: float;
+
+    JumpKeyPressed = {
+        _left = Chirality.Left;
+        _right = Chirality.Right;
+
+        _vrKeyPressed = OR_Multi_Bool(
+            [
+                CosmosController(CurrentUser, _left).JoystickClick,
+                CosmosController(CurrentUser, _right).JoystickClick,
+                HPReverbController(CurrentUser, _left).JoystickClick,
+                HPReverbController(CurrentUser, _right).JoystickClick,
+                IndexController(CurrentUser, _left).JoystickClick,
+                IndexController(CurrentUser, _right).JoystickClick,
+                TouchController(CurrentUser, _left).JoystickClick,
+                TouchController(CurrentUser, _right).JoystickClick,
+                ViveController(CurrentUser, _left).TouchpadClick,
+                ViveController(CurrentUser, _right).TouchpadClick,
+                WindowsMRController(CurrentUser, _left).JoystickClick,
+                WindowsMRController(CurrentUser, _left).TouchpadClick,
+                WindowsMRController(CurrentUser, _right).JoystickClick,
+                WindowsMRController(CurrentUser, _right).TouchpadClick,
+            ]
+        );
+
+        _desktopKeyPressed = KeyPressed(Key.Space);
+        DoubleJumpFly and (_desktopKeyPressed or _vrKeyPressed)
+    };
+
+    ToggleLocomotion = impulse {
+        _currentLocomotion = CurrentUser->GetActiveLocomotionModule;
+        _currentLocomotionName = _currentLocomotion->as<IComponent>->GetSlot->GetSlotName;
+
+        CurrentUser
+        ->SwitchLocomotionModule(
+            if CurrentLocomotionArchetype == LocomotionArchetype.NoClip then "Walk" else "Noclip"
+        );
+    };
+
+    switch FireOnTrue(CurrentUser, JumpKeyPressed)
+    | OnChanged |> impulse {
+        if DoubleJumpFly then impulse {
+            _t = WorldTimeFloat;
+            if (_t - LastPressedTime) <= 0.3 then impulse {
+                ToggleLocomotion;
+                LastPressedTime <- -9999.0;
+            } else impulse {
+                LastPressedTime <- _t;
+            }
+        }
+    };
+
+    // Picture Insert //////////////////////////////////////////////////////////
+    switch ~receive("Cambox.EjectPictureLoader")
+    | OnTriggered |> impulse {
+        // When we want to eject a picture, we toggle a gradient driver on the
+        // frame's position that moves it out of the face. After a couple of
+        // seconds, eject the picture so it's not parented to the avatar.
+        PictureLoaderInserted <- false;
+        StartAsyncTask(
+            impulse {
+                DelaySecondsFloat(2.0);
+                _picture = PictureLoaderSlot->GetChild;
+                if not _picture->HasTag("baca230c-970f-4a5c-8998-b4d8ec3a7469") then {
+                    _picture->SetParent(LocalUserSpace);
+                }
+            }
+        );
+    };
+
+    switch SlotChildrenEvents(CurrentUser, PictureLoaderSlot->asDrivenGlobal)
+    | OnChildAdded |> impulse {
+        // If the frame has something in it, toggle the gradient driver that
+        // moves the frame into the face to show an "animation" of inserting
+        // the picture.
+        StartAsyncTask(
+            impulse {
+                DelaySecondsFloat(0.5);
+                PictureLoaderInserted <- true;
+            }
+        );
+    }
+    | OnChildRemoved |> impulse {
+        PictureLoaderInserted <- false;
+    };
+
+    // Only override the face if something was inserted.
+    FaceTexture = if PictureLoaderInserted then PictureLoaderTexture else DefaultFaceTexture;
+
+    // Picture Eye Movement ////////////////////////////////////////////////////
+    FaceTextureOffset = {
+        if PictureLoaderInserted then {
+            // Custom face doesn't move
+            pack(0.0, 0.0)
+        } else {
+            // The eye texture moves with actual eye movement.
+            _p, _y, _r = EyeRotation->EulerAngles_floatQ->unpack;
+            pack(_y / 45.0, _p / 45.0)
+        }
+    }
+}
