@@ -1,0 +1,127 @@
+/// A ball that bounces against surfaces when thrown, then flies directly back
+/// to the thrower's right hand after a certain time (or if they press
+/// secondary).
+module BouncyBallFidget
+
+in Root: Slot element
+in Grabbable: IGrabbable global
+in AudioClip: IAssetProvider<AudioClip> element
+
+out BounceCount: int
+
+where {
+    GravityEnabled = ~input<bool>("Lixquid.BouncyBallFidget/GravityEnabled").Value;
+    ExpireLength = ~input<float>("Lixquid.BouncyBallFidget/ExpireLength").Value;
+    /// 0: No Sound
+    /// 1: You Only
+    /// 2: Everyone
+    SoundMode = ~input<int>("Lixquid.BouncyBallFidget/SoundMode").Value;
+    CanBeCaught = ~input<bool>("Lixquid.BouncyBallFidget/CanBeCaught").Value;
+
+    sync Velocity: float3;
+    // The WorldTime when the ball should start flying back.
+    sync ExpireTime: float;
+    sync Owner: User;
+    // If the ball is flying directly back.
+    sync ReturningMode: bool;
+    sync BounceCount: int;
+    // We don't allow the ball to be caught for a small period after the ball
+    // has been thrown to avoid "instantly" catching it again.
+    sync CanCatchTime: float;
+
+    Pos = Root->GlobalTransform.GlobalPosition;
+    WorldTime = WorldTimeFloat;
+    VelocityT = Velocity->MulDeltaTime;
+
+    Gravity = if GravityEnabled then pack(0.0, -9.81, 0.0) else pack(0.0, 0.0, 0.0);
+    EmitSound = impulse {
+        if SoundMode != 0 then impulse {
+            AudioClip
+            ->PlayOneShot(
+                Volume=1.0,
+                Speed=1.0 + BounceCount->as<float> * 0.1,
+                Root=Root,
+                LocalOnly=SoundMode == 1
+            );
+        }
+    };
+    /// Stops the ball from moving at all.
+    DisableMoving = impulse {
+        Owner <- null<User>;
+        ExpireTime <- 0.0;
+        ReturningMode <- false;
+        CanCatchTime <- 9e999;
+    };
+
+    switch OnGrabbableGrabbed(Grabbable)
+    | OnGrabbed |> impulse {
+        // If you grab the ball, reset it.
+        DisableMoving;
+        BounceCount <- 0;
+    };
+    switch OnGrabbableReleased(Grabbable)
+    | OnReleased |> impulse {
+        _velocity = Pos->ValueDelta->DivDeltaTime;
+
+        if _velocity->Magnitude_Float3 > 1.0 then impulse {
+            // If the ball is moving fast enough when released, treat it as a
+            // throw.
+            Velocity <- _velocity;
+            ExpireTime <- WorldTime + ExpireLength;
+            Owner <- LocalUser;
+            CanCatchTime <- WorldTime + 1.0;
+        }
+    };
+
+    switch FireWhileTrue(
+        WorldTime < ExpireTime or (ReturningMode and Owner->NotNull),
+        UpdatingUser=Owner->asDrivenGlobal
+    )
+    | OnUpdate |> impulse {
+        if ReturningMode then impulse {
+            // While in return move, lerp towards the owner's right hand.
+            _target = Owner->BodyNodeSlot(BodyNode.RightHand)->GlobalTransform.GlobalPosition;
+            _delta = (_target - Pos)->Mul_Float3_Float(5.0);
+            _deltaT = _delta->MulDeltaTime;
+            Root->SetGlobalPosition(Pos + _deltaT);
+            if _delta->Magnitude_Float3 < 0.5 then impulse {
+                // If we're close enough to their hand, stop moving.
+                DisableMoving;
+            }
+        } else impulse {
+            switch RaycastOne(
+                Origin=Pos + Velocity->Normalized_Float3 * 0.1,
+                Direction=VelocityT,
+                MaxDistance=2.0,
+            )
+            | OnHit _raycast |> impulse {
+                // If the ball is about to hit a wall, bounce off it.
+                Velocity <- Velocity->Reflect_Float3(_raycast.HitNormal);
+                BounceCount <- BounceCount + 1;
+                EmitSound;
+                Root->SetGlobalPosition(_raycast.HitPoint + _raycast.HitNormal->Mul_Float3_Float(0.01));
+            }
+            | OnMiss |> impulse {
+                // Otherwise, move forward.
+                Velocity <- Velocity + Gravity->MulDeltaTime;
+                Root->SetGlobalPosition(Pos + VelocityT);
+            };
+        };
+    };
+    {
+        _expired = WorldTime > ExpireTime;
+        _userRecalled = Owner->StandardController(Chirality.Right).Secondary;
+        switch Owner->FireOnTrue(_expired or _userRecalled)
+        | OnChanged |> impulse {
+            // If the ball's been out long enough or we've pressed secondary,
+            // start moving back.
+            ReturningMode <- true;
+        };
+    };
+    {
+        // If anyone locally "catches" the ball by having their hand be close
+        // enough to it, stop moving. Nice catch!
+        switch FireOnLocalTrue(Root->NearestUserHand.Distance < 0.2 and CanCatchTime < WorldTime)
+        | OnChange |> DisableMoving;
+    }
+}
